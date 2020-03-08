@@ -146,4 +146,4 @@ void WorkerLoop(int thread_id) {
 
 
 线程池的大体流程如下：
-![在这里插入图片描述](./threadpool./threadpool_workflow.png)
+![在这里插入图片描述](./threadpool/threadpool_workflow.png)
