@@ -4,7 +4,7 @@ TensorFlow 是高效的深度学习计算框架，以计算子`operator`为单�
 TensorFlow的线程池直接封装Eigen 的`threadpool`,菜鸟今天从eigen到TensorFlow源码一层层细细品味`eigen::threadpool` 机制源码。
 ## 1.tensorflow 与eigen 的threadpool 界面
 先看看在TensorFlow中的threadpool 类图架构：
-![tensorflow_threadpool_classgraph.png](threadpool\tensorflow_threadpool_classgraph.png)
+![tensorflow_threadpool_classgraph.png](./threadpool/tensorflow_threadpool_classgraph.png)
 
 
 在TensorFlow源码`tensorflow/core/platform/threadpool.h`文件中230-237行：
@@ -47,7 +47,7 @@ typedef SimpleThreadPool ThreadPool;
 ```
 ## 2 eigen 中的threadpool
 从上面的描述中可以知道，在Eigen库中，有两种线程管理方式，即`NonBlockThreadPool`和`SimpleThreadPool`，在默认情况下TensorFlow使用`NonBlockThreadPool`。为了简单起见，这里仅从比较简洁明了的SimpleThreadPool简单线程管理机制阐述相应的内容，它定义在SimpleThreadPool.h文件中。先看一下源码的类图：
-![eigen_threadpool_classgraph.png](threadpool\eigen_threadpool_classgraph.png)
+![eigen_threadpool_classgraph.png](./threadpool/eigen_threadpool_classgraph.png)
 我们首先分析它的构造函数。
 ```cpp
  // Construct a pool that contains "num_threads" threads.
@@ -146,4 +146,4 @@ void WorkerLoop(int thread_id) {
 
 
 线程池的大体流程如下：
-![在这里插入图片描述](threadpool\threadpool_workflow.png)
+![在这里插入图片描述](./threadpool/threadpool_workflow.png)
