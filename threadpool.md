@@ -4,7 +4,7 @@ TensorFlow 是高效的深度学习计算框架，以计算子`operator`为单�
 TensorFlow的线程池直接封装Eigen 的`threadpool`,菜鸟今天从eigen到TensorFlow源码一层层细细品味`eigen::threadpool` 机制源码。
 ## 1.tensorflow 与eigen 的threadpool 界面
 先看看在TensorFlow中的threadpool 类图架构：
-![tensorflow_threadpool_classgraph.png](threadpool\tensorflow_threadpool_classgraph.png)
+![tensorflow_threadpool_classgraph.png](./threadpool/tensorflow_threadpool_classgraph.png)
 
 
 在TensorFlow源码`tensorflow/core/platform/threadpool.h`文件中230-237行：
