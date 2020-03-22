@@ -160,5 +160,80 @@ nodes)。当一个节点的所有输入都可用时，该节点(合并节点(mer
 对于分布式执行，一个while循环，特别是循环体，可以被划分到多个设备上。如果纯粹地应用跨设备边添加send/recv节点的分区方案，设备上的本地执行器将没有足够的信息来正确运行while循环。 
 ![naive_partitioning_breaks](./control_flow_op/naive_partioning_breaks.png)
 
-让我们用一个简单的例子来说明这些问题。在上面的例子中，Op在循环体中，并被分配给设备B。一个简单的分区只需要使用一对send/recv节点就可以将边缘从Switch断开到Op。但是，这将不起作用，因为设备B不知道recv和Op节点是while循环的一部分，并且将在一次迭代后终止执行。解决方案是重写数据流图，在每个分区中添加一个控制循环状态机（如下设备B的右下角所示）。标量张量0用作控制循环的输入节点。
-![](./control_flow_op/distributing_control_loop.jpg)
+让我们用一个简单的例子来说明这些问题。在上面的例子中，Op在循环体中，并被分配给设备B。一个简单的分区只需要使用一对send/recv节点就可以将边缘从Switch断开到Op。但是，这将不起作用，因为设备B不知道recv和Op节点是while循环的一部分，并且将在一次迭代后终止执行。解决方案是要重写数据流图，在每个分区中添加一个控制循环状态机（如下设备B的右下角所示）。标量张量0用作控制循环的输入节点。
+![distributing_control_loop](./control_flow_op/distributing_control_loop.jpg)
+
+这些控制循环提供足够的信息，允许设备上的执行器像以前一样独立运行，通过send/recv节点相互通信。注意虚线是控制边。
+
+更详细地说，让我们首先看看while循环只运行0次迭代的基本情况：
+- 在设备A上，执行从节点Enter、Merge、P和Switch开始。由于P为false，连接Switch的send会将死区(dead signal)信号传播到设备B，并且设备A上的Exit也会运行，从而启用循环外节点的并发执行。连接到P的Send会将布尔张量False发送到设备B。还触发执行Recv，等待设备B的返回值。
+- 在设备B上，执行从节点Enter和Merge开始。执行Merge将启用两个recv。Switch的Recv将收到False，因此Next将得到一个死张量。下一步是停止死亡(dead)的传播。Op的Recv将得到一个死张量(dead tensor)，这样Op的Send将把一个死张量(dead tensor)发送回设备A。此时，设备B没有未完成的ops，因此执行终止。
+- 回到设备A，Next的Recv得到一个死张量。下一次运行时，由于它停止了死区的传播，设备A没有未完成的操作，因此执行终止。
+
+现在假设while循环运行一个或多个迭代：
+- 在设备A上，由于P在第一次迭代时为true，因此会向设备B发送一个实张量。执行Recv，等待设备B的值。
+- 在设备B上，控制回路状态机(control-loop state machine)运行并启用recv。Op的Recv从设备A得到一个实张量；Op被执行并且发送一个实张量回设备A。Switch的Recv得到布尔张量True。执行Next和Merge，进一步为下一次迭代启用recv。
+- 回到设备A，Recv得到一个真正的张量。接下来，Merge和P被执行。根据P的值，将执行基本情况或新的迭代。
+
+注意，在执行过程中有很多并行性。例如，设备B在接收到P的值后可以开始下一个迭代或退出。参与设备可以并行运行多个迭代，并且两个参与设备可以在同一循环的不同迭代上工作。
+
+while循环的分布式执行的开销是，每个参与设备在每次迭代时都需要从产生P的设备接收布尔张量。考虑到执行过程中的并行性，应该在很大程度上隐藏开销。
+
+下面显示了在跨多个设备分区while循环时数据流图的外观。控制循环被添加到每个分区，并控制while循环中的recv。重写后的图在语义上等价于原始图。
+![graph_partition_rewrite](./control_flow_op/graph_partition_rewrite.jpg)
+
+对于嵌套的while循环，只将控制循环堆栈如下。注意，如果一个设备只有外环的节点，不会为该设备上的任何内环添加控制环。
+![nest_while_loop](./control_flow_op/nest_while_loop.png)
+
+## 自动微分
+
+TensorFlow支持自动微分。例如，用户可以定义一个具有损失函数的神经网络，TensorFlow将自动求导并构建反向传播数据流图。本节说明了TensorFlow如何在cond和while_循环存在时自动构建反向传播图。
+
+反向传播算法通过反向遍历前向图中的ops，通过调用ops的梯度函数逐步构造梯度图。op的梯度函数定义了计算op的符号梯度的子图。梯度函数可以使用op的输入/输出值，因此在前向计算中产生的一些张量将保留一段时间，直到在backprop中使用为止。例如，下面显示了一个正向操作及其梯度图。G（Op）是Op的梯度子图，x和y的值将保存在内存中，直到G（Op）被执行。
+
+![back_forward_progration](./control_flow_op/back_forward_progration.png)
+
+一旦构建了整个数据流图，TensorFlow运行时将自动对该图进行分区，并将执行分布在多个设备上。因此，TensorFlow中的梯度计算也将分布到多个设备上运行。
+直观地说，在我们的cond和while_循环的高层结构中，控制流操作符的反向传播只是按照以下方式反向流动：Exit的梯度是Enter；Switch的梯度是Merge（对于cond）或NextIteration，然后是Merge（对于while_循环）；Merge的梯度是Switch；关系的梯度是恒等的，梯度的Enter就是Exit。TensorFlow支持嵌套条件和while循环的反向传播。
+
+### 有条件的反向传播
+直观地讲，cond(p，fn1，fn2)的梯度是cond(p，g_fn1，g_fn2)，其中g_fn1和g_fn2分别是fn1和fn2的梯度。下面显示当cond未嵌套在while循环中时cond的基本反向传播。假设Op在cond的真分支上。嵌套在while循环中的cond需要更多的工作来记住前向循环每次迭代的p值。稍后再看一下while循环的backprop。
+![cond_backforward](./control_flow_op/cond_backforward.jpg)
+
+forward Merge被转换成一个Switch，它使用与forward Switch相同的谓词p。梯度g<sub>y</sub>分发到Switch的两个分支上。forward Switch变为了Merge。如果forward中只使用forward Switch的一个分支，需要添加一个零，如下所示，以确保始终有一个活的梯度流过backprop中的Merge。这个0 由一个Switch来控制，因此只有当p为false时，它才会被发送到Merge中。
+![Switch2Merge](./control_flow_op/Switch2Merge.jpg)
+
+### While循环的反向传播
+
+直观地说，while_loop(pred，body)的梯度类似于一下的while loop形式：
+```python
+def pred(i, _): return i < N
+while_loop(pred, g_body, [0] + g_vars)
+```
+其中N是forward while循环运行的迭代次数，g_body是forward循环体的梯度，g_vars是循环变量的初始值。稍后将看到，g_vars包含forward while循环变量的初始梯度。while循环及其backprop while循环的图形大致如下：
+![while_backprop](./control_flow_op/while_backprop.jpg)
+
+backprop循环由N控制，N 为前向循环将运行的迭代次数，其中假设循环条件pred是不可训练的。G（Body）是运算主体的梯度。
+
+Body可能再次包含while循环，因此此构造可以递归地发生以处理嵌套while循环。
+到目前为止，这一描述相当过于简单化。例如，N在图构造时是静态未知的。更重要的是，G（Body）可能使用由forward循环体生成的值，我们希望保留这些值，以避免在backprop中重新计算它们。TensorFlow中的解决方式是重写forward while循环的graph，以添加计算和(或)保存backprop中所需的值的逻辑。
+
+为了计算N，我们将以下子图添加到forward while循环中。因此，N将由前向循环动态计算，并发送给backprop循环的循环次数计数器作为变量的初始值。
+![while_forward_dynamic_fed_backprop](./control_flow_op/while_forward_dynamic_fed_backprop.jpg)
+
+为了在backprop循环中重用前向的值，TensorFlow在backprop while循环的构造过程中自动检测backprop中所需的前向值。对于每个这样的前向值x，会自动引入一个堆栈，并在前向循环(forward while)中添加节点，以在每次迭代时将其值保存到堆栈中。backprop循环按相反的顺序使用堆栈中的值。堆栈位于forward和backprop循环之外，由这两个循环共享。
+![while_forward_backprop_share_stack](./control_flow_op/while_forward_backprop_share_stack.jpg)
+
+实际的图形构造实际上比这更微妙和复杂。tensorflow在这里还涉及很多细节，比如还有一下这些问题：
+- 为了确保正确性，必须确保堆栈推送和pop按其各自循环的迭代顺序排列。还要确保先在前向循环中向栈中push值之后，才可能在堆栈中弹出到backprop，这需要使用控制边(control edge)强制执行排序。
+- 为了提高性能，TensorFlow将堆栈推送和弹出操作设为异步操作，以便它们可以与实际计算并行运行。例如，op（甚至未来的迭代）可以与Push并行运行。
+- 如果op位于while循环中嵌套的cond中，那么cond的谓词必须正确地确保push和pop操作正确执行。
+- 如果值立即被backprop中的reduce op（例如Shape、Rank或Size）减少，TensorFlow会将reduce op移动到forward循环以减少内存使用。
+
+对于循环变量，如前所述，反向传播的梯度的Enter是Exit，以上就是它所做的一切。对于循环常数，TensorFlow还添加一个子图来累积它们的梯度，如下所示。
+![while_constant_gradient_accumulate](./control_flow_op/while_constant_gradient_accumulate.png)
+
+假设x是向前的循环常数。在backprop中，每次迭代都会生成x的部分梯度。所以在backprop中添加小的累加子图来将所有这些部分梯度相加。出口处的最终g<sub>x</sub>是所有部分梯度的总和。注意，累积是迫不及待地完成的，以并行迭代次数为界。这与静态展开不同，在静态展开中，AddN的使用需要同时激活所有的局部梯度。
+这种构造对嵌套条件和循环都有效。对于嵌套在while循环中的cond，TensorFlow引入一个堆栈来保存每次前向迭代时谓词的值，并在backprop中使用堆栈中的值（以相反的顺序）。对于嵌套循环，当遇到嵌套在循环体中的内部while循环时，将递归调用此构造。
+
+一个重要的优化是内存交换。正如我们所看到的，对于backprop中需要的每个正向值v，将其在所有迭代v<sub>1</sub>，…，v<sub>N</sub>中的值保存在堆栈中，以便在backprop中重用它们。这可能是在内存有限的设备（如gpu）上进行培训的限制。我们使用内存交换将堆栈中存储的值从GPU异步移动到CPU，并在backprop中需要时将它们移回GPU内存。
